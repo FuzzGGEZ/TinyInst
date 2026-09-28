@@ -21,6 +21,7 @@ limitations under the License.
 #include <list>
 #include <unordered_set>
 #include <unordered_map>
+#include <vector>
 
 #include "common.h"
 #include "windows.h"
@@ -85,10 +86,15 @@ public:
     bool maybe_write_violation;
     bool maybe_execute_violation;
     void *access_address;
+    std::vector<std::string> stack_signature_frames;
   };
 
   Exception GetLastException() {
     return last_exception;
+  }
+
+  void SetCrashStackCollection(bool enabled) {
+    collect_crash_stack = enabled;
   }
 
 protected:
@@ -239,6 +245,7 @@ private:
   void RetrieveThreadContext();
   void CreateException(EXCEPTION_RECORD *win_exception_record,
                        Exception *exception);
+  void CaptureStackSignature(Exception *exception);
 
   Exception last_exception;
   // thread id of the last event
@@ -248,6 +255,7 @@ private:
   size_t allocation_granularity;
 
   bool force_dep;
+  bool collect_crash_stack = false;
 };
 
 #endif // DEBUGGER_H

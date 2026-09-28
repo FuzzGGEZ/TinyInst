@@ -19,6 +19,8 @@ limitations under the License.
 #include <stdio.h>
 #include <stdbool.h>
 #include <inttypes.h>
+#include <ctype.h>
+#include <string.h>
 
 #include "windows.h"
 #include "psapi.h"
@@ -45,6 +47,8 @@ void Debugger::DeleteBreakpoints() {
 void Debugger::CreateException(EXCEPTION_RECORD *win_exception_record,
                                Exception *exception)
 {
+  exception->stack_signature_frames.clear();
+
   switch (win_exception_record->ExceptionCode) {
   case EXCEPTION_BREAKPOINT:
   case 0x4000001f:
@@ -81,6 +85,164 @@ void Debugger::CreateException(EXCEPTION_RECORD *win_exception_record,
   }
 }
 
+void Debugger::CaptureStackSignature(Exception *exception) {
+  exception->stack_signature_frames.clear();
+
+  if (!collect_crash_stack) return;
+  if (!child_handle) return;
+
+  struct ModuleRange {
+    size_t begin;
+    size_t end;
+    std::string name;
+  };
+
+  std::vector<ModuleRange> module_ranges;
+  HMODULE *module_handles = NULL;
+  DWORD num_modules = GetLoadedModules(&module_handles);
+
+  char windows_directory[MAX_PATH] = { 0 };
+  GetWindowsDirectoryA(windows_directory, MAX_PATH);
+
+  std::string windows_prefix = windows_directory;
+  for (size_t i = 0; i < windows_prefix.size(); i++) {
+    windows_prefix[i] =
+      (char)tolower((unsigned char)windows_prefix[i]);
+  }
+
+  for (DWORD i = 0; i < num_modules; i++) {
+    char module_path[MAX_PATH] = { 0 };
+
+    if (!GetModuleFileNameExA(
+          child_handle,
+          module_handles[i],
+          module_path,
+          MAX_PATH)) {
+      continue;
+    }
+
+    std::string lower_path = module_path;
+    for (size_t j = 0; j < lower_path.size(); j++) {
+      lower_path[j] =
+        (char)tolower((unsigned char)lower_path[j]);
+    }
+
+    if (!windows_prefix.empty() &&
+        lower_path.compare(
+          0, windows_prefix.size(), windows_prefix) == 0) {
+      continue;
+    }
+
+    MODULEINFO module_info;
+    memset(&module_info, 0, sizeof(module_info));
+
+    if (!GetModuleInformation(
+          child_handle,
+          module_handles[i],
+          &module_info,
+          sizeof(module_info))) {
+      continue;
+    }
+
+    size_t separator = lower_path.find_last_of("\\/");
+    std::string module_name =
+      separator == std::string::npos ?
+        lower_path : lower_path.substr(separator + 1);
+
+    size_t extension = module_name.find_last_of('.');
+    if (extension != std::string::npos) {
+      module_name.erase(extension);
+    }
+
+    ModuleRange range;
+    range.begin = (size_t)module_info.lpBaseOfDll;
+    range.end = range.begin + module_info.SizeOfImage;
+    range.name = module_name;
+    module_ranges.push_back(range);
+  }
+
+  if (module_handles) free(module_handles);
+  if (module_ranges.empty()) return;
+
+  RetrieveThreadContext();
+  size_t stack_pointer = GetRegister(RSP);
+  if (!stack_pointer) return;
+
+  const size_t stack_item_limit = 0x200;
+  size_t requested_bytes = stack_item_limit * child_ptr_size;
+  std::vector<unsigned char> stack_data(requested_bytes);
+  SIZE_T bytes_read = 0;
+
+  ReadProcessMemory(
+    child_handle,
+    (void *)stack_pointer,
+    stack_data.data(),
+    requested_bytes,
+    &bytes_read);
+
+  size_t stack_items = bytes_read / child_ptr_size;
+  std::unordered_set<std::string> observed_frames;
+
+  for (size_t i = 0; i < stack_items; i++) {
+    uint64_t pointer_value = 0;
+    memcpy(
+      &pointer_value,
+      stack_data.data() + i * child_ptr_size,
+      child_ptr_size);
+
+    size_t address = (size_t)pointer_value;
+
+    for (size_t j = 0; j < module_ranges.size(); j++) {
+      const ModuleRange &range = module_ranges[j];
+
+      if (address < range.begin || address >= range.end) {
+        continue;
+      }
+
+      MEMORY_BASIC_INFORMATION memory_info;
+      memset(&memory_info, 0, sizeof(memory_info));
+
+      if (!VirtualQueryEx(
+            child_handle,
+            (void *)address,
+            &memory_info,
+            sizeof(memory_info))) {
+        continue;
+      }
+
+      DWORD protection = memory_info.Protect & 0xFF;
+      bool executable =
+        protection == PAGE_EXECUTE ||
+        protection == PAGE_EXECUTE_READ ||
+        protection == PAGE_EXECUTE_READWRITE ||
+        protection == PAGE_EXECUTE_WRITECOPY;
+
+      if (!executable ||
+          (memory_info.Protect & PAGE_GUARD) != 0) {
+        continue;
+      }
+
+      char offset[32];
+      snprintf(
+        offset,
+        sizeof(offset),
+        "+0x%llX",
+        (unsigned long long)(address - range.begin));
+
+      std::string frame = range.name + offset;
+
+      if (observed_frames.insert(frame).second) {
+        exception->stack_signature_frames.push_back(frame);
+      }
+
+      break;
+    }
+
+    if (exception->stack_signature_frames.size() >= 2) {
+      break;
+    }
+  }
+}
 void Debugger::RetrieveThreadContext() {
   if (have_thread_context) return; // already done
   lcContext.ContextFlags = CONTEXT_ALL;
@@ -1472,6 +1634,7 @@ DebuggerStatus Debugger::HandleExceptionInternal(EXCEPTION_RECORD *exception_rec
       HandleTargetEnded();
       return DEBUGGER_TARGET_END;
     } else {
+      CaptureStackSignature(&last_exception);
       // Debug(&DebugEv->u.Exception.ExceptionRecord);
       dbg_continue_status = DBG_EXCEPTION_NOT_HANDLED;
       return DEBUGGER_CRASHED;
@@ -1486,6 +1649,7 @@ DebuggerStatus Debugger::HandleExceptionInternal(EXCEPTION_RECORD *exception_rec
   case STATUS_HEAP_CORRUPTION:
   case STATUS_STACK_BUFFER_OVERRUN:
   case STATUS_FATAL_APP_EXIT:
+    CaptureStackSignature(&last_exception);
     dbg_continue_status = DBG_EXCEPTION_NOT_HANDLED;
     return DEBUGGER_CRASHED;
     break;
