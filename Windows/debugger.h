@@ -186,7 +186,7 @@ private:
   void HandleTargetEnded();
   char *GetTargetAddress(HMODULE module);
   void AddBreakpoint(void *address, int type);
-  DWORD GetLoadedModules(HMODULE **modules);
+  DWORD GetLoadedModules(HMODULE **modules, bool fatal_on_error = true);
   void DeleteBreakpoints();
   DWORD WindowsProtectionFlags(MemoryProtection protection);
   DWORD GetImageSize(void *base_address);

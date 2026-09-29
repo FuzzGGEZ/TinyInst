@@ -99,7 +99,7 @@ void Debugger::CaptureStackSignature(Exception *exception) {
 
   std::vector<ModuleRange> module_ranges;
   HMODULE *module_handles = NULL;
-  DWORD num_modules = GetLoadedModules(&module_handles);
+  DWORD num_modules = GetLoadedModules(&module_handles, false);
 
   char windows_directory[MAX_PATH] = { 0 };
   GetWindowsDirectoryA(windows_directory, MAX_PATH);
@@ -858,7 +858,7 @@ void Debugger::PatchPointersRemoteT(size_t min_address, size_t max_address, std:
 }
 
 // returns an array of handles for all modules loaded in the target process
-DWORD Debugger::GetLoadedModules(HMODULE **modules) {
+DWORD Debugger::GetLoadedModules(HMODULE **modules, bool fatal_on_error) {
   DWORD module_handle_storage_size = 1024 * sizeof(HMODULE);
   HMODULE *module_handles = (HMODULE *)malloc(module_handle_storage_size);
   DWORD hmodules_size;
@@ -869,7 +869,20 @@ DWORD Debugger::GetLoadedModules(HMODULE **modules) {
                               &hmodules_size,
                               LIST_MODULES_ALL))
     {
-      FATAL("EnumProcessModules failed, %x\n", GetLastError());
+      DWORD error = GetLastError();
+
+      if (fatal_on_error) {
+        FATAL("EnumProcessModules failed, %x\n", error);
+      }
+
+      printf(
+        "[!] WARNING: EnumProcessModules failed while collecting "
+        "crash stack, %x; using fallback signature\n",
+        error);
+
+      free(module_handles);
+      *modules = NULL;
+      return 0;
     }
     if (hmodules_size <= module_handle_storage_size) break;
     module_handle_storage_size *= 2;
